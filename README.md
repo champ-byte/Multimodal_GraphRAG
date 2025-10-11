@@ -1,6 +1,6 @@
 # Multimodal_GraphRAG
 
-
+[DOCUMENTATION](https://manaswibrane.github.io/django/)
 # Components:
 ## Sentence transformer
 Converts textual content (like PDF text or chunks) into vector embeddings.
