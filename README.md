@@ -125,3 +125,61 @@ cd project-name
 
 # Install dependencies
 pip install -r requirements.txt
+```
+
+---
+
+## How to Use
+
+### 1. Environment Setup
+
+Create a `.env` file in the project root with the following variables:
+
+```env
+GOOGLE_API_KEY=your_google_api_key
+NEO4J_AURA_URI=neo4j+s://your-instance.databases.neo4j.io
+NEO4J_AURA_USERNAME=neo4j
+NEO4J_AURA_PASSWORD=your_password
+NEO4J_AURA_DATABASE=neo4j
+```
+
+### 2. CSV GraphRAG (`csv_rag.py`)
+
+```bash
+python csv_rag.py
+# Opens at http://127.0.0.1:7861
+```
+
+**Steps:**
+1. **Upload** any `.csv` file.
+2. **Select node columns** — pick which CSV columns become graph nodes (e.g. `product_name`, `category`, `brand`).
+3. **Define relationships** — add rows to the table specifying source column → target column → label (e.g. `product_name` → `category` → `BELONGS_TO`).
+4. **Build Graph** — generates CLIP embeddings and inserts nodes/relationships into Neo4j.
+5. **Query** — switch to the Query tab and ask natural-language questions.
+
+**Image support (optional):**
+- If your CSV has an `image_path` column, place the corresponding image files inside the `static/` folder.
+- The code looks for images at `static/<image_path_value>` and uses CLIP to create a combined text + image embedding.
+- If no `image_path` column exists, or images are missing, the pipeline uses **text-only** embeddings — everything still works.
+
+**Example CSV format:**
+
+```csv
+product_id,product_name,category,brand,price,description,image_path
+1,Wireless Mouse,Electronics,Logitech,899,Ergonomic wireless mouse,mouse.jpg
+2,Running Shoes,Footwear,Nike,5999,Lightweight running shoes,shoes.jpg
+```
+
+> The `image_path` column is optional. Without it the pipeline runs in text-only mode.
+
+### 3. PDF GraphRAG (`pdf_rag.py`)
+
+```bash
+python pdf_rag.py
+# Opens at http://127.0.0.1:7860
+```
+
+1. Upload a **PDF** file — text and images are extracted automatically.
+2. The pipeline builds a knowledge graph from the PDF content.
+3. Query the graph from the **Query** tab.
+
