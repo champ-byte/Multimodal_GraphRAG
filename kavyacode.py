@@ -1,4 +1,4 @@
-GOOGLE_API_KEY="AIzaSyDym4fxzRIB5kSiMANltRSLpED_MKUSGiQ"
+GOOGLE_API_KEY="api-key"
 
 # This cell contains the setup code (PDF processing, graph creation, FAISS index creation)
 # It only needs to be run once.
