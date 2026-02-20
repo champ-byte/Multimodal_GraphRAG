@@ -1,149 +1,136 @@
-GOOGLE_API_KEY="api-key"
-
-# This cell contains the setup code (PDF processing, graph creation, FAISS index creation)
-# It only needs to be run once.
-
+import os
 import uuid
-from dotenv import load_dotenv
+import io
 from typing import List, Dict, Any
 
-# File processing
+from dotenv import load_dotenv
 import fitz  # PyMuPDF
 from PIL import Image
-import io
+import numpy as np
+import faiss
+import gradio as gr
 
-# LangChain components
-from langchain.docstore.document import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-# from langchain_community.graphs import Neo4jGraph
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_neo4j import Neo4jGraph
-
-# Embeddings and Vector Store
+from langchain_google_genai import ChatGoogleGenerativeAI
 from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
 
-# Load environment variables from .env file
+# ---------------------------------------------------------------------------
+# Load environment variables
+# ---------------------------------------------------------------------------
 load_dotenv()
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+NEO4J_URI = os.getenv("NEO4J_AURA_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_AURA_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_AURA_PASSWORD")
+NEO4J_DATABASE = os.getenv("NEO4J_AURA_DATABASE", "neo4j")  # default is 'neo4j'
 
-NEO4J_URI="neo4j+s://61986679.databases.neo4j.io"
-NEO4J_USERNAME="neo4j"
-NEO4J_PASSWORD="bpPcx73PRuDgRVptDJ9jZYAYsG0NhbAFr3CRjVlWAJE"
+# ---------------------------------------------------------------------------
+# Module-level state — services initialised lazily on first PDF upload
+# ---------------------------------------------------------------------------
+_state: Dict[str, Any] = {
+    "faiss_index": None,
+    "index_to_chunk_id": None,
+    "all_chunk_data": None,
+    "ready": False,
+    # services (filled by _init_services)
+    "graph": None,
+    "llm": None,
+    "embedding_model": None,
+    "services_ready": False,
+}
 
-# Instantiate the Neo4j graph connection
-graph = Neo4jGraph(
-    url=NEO4J_URI,
-    username=NEO4J_USERNAME,
-    password=NEO4J_PASSWORD
-)
 
-# Instantiate the LLM for graph transformation
-# Using a specific model version for reproducibility
-from langchain_google_genai import ChatGoogleGenerativeAI
+def _init_services():
+    """Connect to Neo4j, load LLM and embedding model (called once on first use)."""
+    if _state["services_ready"]:
+        return
+    try:
+        _state["graph"] = Neo4jGraph(
+            url=NEO4J_URI,
+            username=NEO4J_USERNAME,
+            password=NEO4J_PASSWORD,
+            database=NEO4J_DATABASE,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not connect to Neo4j.\n"
+            f"Check NEO4J_AURA_URI / credentials in your .env file.\n\nDetail: {e}"
+        )
+    _state["llm"] = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+    _state["embedding_model"] = SentenceTransformer("clip-ViT-B-32")
+    _state["services_ready"] = True
 
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro")
 
-# Instantiate the CLIP model for embeddings
-# This will download the model on the first run
-embedding_model = SentenceTransformer('clip-ViT-B-32')
+# ===========================================================================
+# Pipeline functions
+# ===========================================================================
 
-# --- 1. PDF Data Extraction ---
 def process_pdf(pdf_path: str) -> List[Dict]:
-    """
-    Extracts text and images from a PDF file and associates them.
-    Each element in the output list represents a page.
-    """
+    """Extract text and images from every page of a PDF."""
     doc = fitz.open(pdf_path)
     processed_data = []
-    print(f"Processing PDF: {pdf_path} with {len(doc)} pages.")
 
     for page_num, page in enumerate(doc):
-        # Extract text
         text = page.get_text()
-
-        # Extract images
         images = []
-        for img_index, img in enumerate(page.get_images(full=True)):
+        for img in page.get_images(full=True):
             xref = img[0]
             base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            image = Image.open(io.BytesIO(image_bytes))
-            images.append(image)
+            images.append(Image.open(io.BytesIO(base_image["image"])))
 
         processed_data.append({
             "page_num": page_num + 1,
             "text": text,
-            "images": images
+            "images": images,
         })
-        print(f"  - Extracted text and {len(images)} images from page {page_num + 1}.")
 
     doc.close()
     return processed_data
 
-# --- 2. Chunking and Graph Creation ---
-def create_graph_from_chunks(data: List[Dict]):
-    """
-    Chunks text, creates graph documents, and adds them to Neo4j.
-    Returns the raw text chunks with unique IDs and associated images.
-    """
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=256, chunk_overlap=50)
 
-    all_chunks_with_images = []
+def create_graph_from_chunks(data: List[Dict]) -> List[Dict]:
+    """Chunk text, build a knowledge graph in Neo4j, return chunks with images."""
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=256, chunk_overlap=50)
+    all_chunks_with_images: List[Dict] = []
 
     for page_data in data:
-        page_text = page_data["text"]
-        if not page_text.strip():
+        if not page_data["text"].strip():
             continue
 
-        # Chunk the text from the page
-        chunks = text_splitter.split_text(page_text)
-
+        chunks = text_splitter.split_text(page_data["text"])
         for chunk in chunks:
             chunk_id = str(uuid.uuid4())
-            # Create a Document object for LangChain
             doc = Document(
                 page_content=chunk,
-                metadata={"source_page": page_data["page_num"], "chunk_id": chunk_id}
+                metadata={"source_page": page_data["page_num"], "chunk_id": chunk_id},
             )
-
-            # Extract graph data from the document
             try:
-                llm_transformer=LLMGraphTransformer(llm=llm)
-                graph_documents = llm_transformer.convert_to_graph_documents([doc])
-                print(f"  - Generated {len(graph_documents[0].nodes)} nodes and {len(graph_documents[0].relationships)} relationships for a chunk.")
+                transformer = LLMGraphTransformer(llm=_state["llm"])
+                graph_documents = transformer.convert_to_graph_documents([doc])
 
-                # Add a 'source_chunk_id' property to all nodes and relationships
                 for node in graph_documents[0].nodes:
                     node.properties["source_chunk_id"] = chunk_id
                 for rel in graph_documents[0].relationships:
                     rel.properties["source_chunk_id"] = chunk_id
 
-
-                # Add to Neo4j
-                graph.add_graph_documents(graph_documents)
+                _state["graph"].add_graph_documents(graph_documents)
                 all_chunks_with_images.append({
                     "chunk_id": chunk_id,
                     "text": chunk,
-                    "images": page_data["images"] # Associate images with the chunk
-                    })
-
-
+                    "images": page_data["images"],
+                })
             except Exception as e:
                 print(f"Error processing a chunk: {e}")
 
     return all_chunks_with_images
 
-# --- 3. Deduplication and Entity Disambiguation Setup ---
-def find_and_merge_duplicates(graph: Neo4jGraph):
-    """
-    Finds and merges nodes that are likely duplicates based on their 'id' property.
-    This is a basic approach; more sophisticated methods might be needed for complex cases.
-    """
-    print("\nAttempting to find and merge duplicate nodes...")
-    # This query finds nodes with the same 'id' and merges them, keeping the oldest node.
-    # It also merges relationships connected to the duplicate nodes.
+
+def find_and_merge_duplicates():
+    """Merge duplicate nodes in Neo4j based on their 'id' property."""
     merge_query = """
     MATCH (n)
     WITH n.id AS nodeId, collect(n) AS nodes
@@ -152,192 +139,174 @@ def find_and_merge_duplicates(graph: Neo4jGraph):
     RETURN count(*) AS merged_count
     """
     try:
-        result = graph.query(merge_query)
-        merged_count = result[0]['merged_count'] if result else 0
-        print(f"Merged {merged_count} sets of duplicate nodes based on 'id'.")
+        result = _state["graph"].query(merge_query)
+        return result[0]["merged_count"] if result else 0
     except Exception as e:
-        print(f"Error during node merging: {e}")
-        print("Please ensure you have the APOC plugin installed and enabled in your Neo4j database.")
+        print(f"Error during node merging (APOC may not be installed): {e}")
+        return 0
 
 
-# def identify_potential_disambiguation_candidates(graph: Neo4jGraph) -> Dict[str, Dict[str, Any]]:
-#     """
-#     Identifies potential entities that might require disambiguation.
-#     This basic version finds nodes with similar sounding IDs or that appear in related chunks.
-#     Returns a dictionary where keys are potential entity names/IDs and values are details.
-#     """
-#     print("\nIdentifying potential entity disambiguation candidates...")
-#     # This query finds nodes that share a source_chunk_id, indicating they appeared in the same chunk.
-#     # It can be a starting point for identifying entities that might be related or duplicates.
-#     candidate_query = """
-#     MATCH (n)
-#     WHERE n.source_chunk_id IS NOT NULL
-#     WITH n.source_chunk_id AS chunkId, collect({id: n.id, label: labels(n)[0], properties: properties(n)}) AS nodes_in_chunk
-#     WHERE size(nodes_in_chunk) > 1
-#     RETURN chunkId, nodes_in_chunk
-#     """
-
-#     candidates_by_chunk = graph.query(candidate_query)
-#     potential_candidates = {}
-
-#     for record in candidates_by_chunk:
-#         chunk_id = record['chunkId']
-#         nodes_in_chunk = record['nodes_in_chunk']
-#         for node_info in nodes_in_chunk:
-#             node_id = node_info['id']
-#             if node_id not in potential_candidates:
-#                 potential_candidates[node_id] = {
-#                     "label": node_info.get('label', 'Unknown'),
-#                     "source_chunk_ids": [chunk_id],
-#                     "properties": node_info.get('properties', {})
-#                 }
-#             else:
-#                 if chunk_id not in potential_candidates[node_id]["source_chunk_ids"]:
-#                     potential_candidates[node_id]["source_chunk_ids"].append(chunk_id)
-
-#     print(f"Identified {len(potential_candidates)} potential entity disambiguation candidates.")
-#     # In a real scenario, you'd do more sophisticated analysis here (e.g., string similarity)
-#     return potential_candidates
-
-
-# --- 4. Embeddings and FAISS Indexing ---
 def create_faiss_index(chunks: List[Dict]):
-    """
-    Creates multimodal embeddings for text and images and stores them in FAISS.
-    Returns the FAISS index and a mapping from FAISS index to chunk_id.
-    """
+    """Build a FAISS index from text + image embeddings."""
     embeddings = []
     index_to_chunk_id = {}
-    current_index = 0
+    idx = 0
 
-    print("\nGenerating embeddings and building FAISS index...")
     for chunk_data in chunks:
-        # 1. Embed the text chunk
-        text_embedding = embedding_model.encode(chunk_data["text"])
-        embeddings.append(text_embedding)
-        index_to_chunk_id[current_index] = chunk_data["chunk_id"]
-        current_index += 1
+        text_emb = _state["embedding_model"].encode(chunk_data["text"])
+        embeddings.append(text_emb)
+        index_to_chunk_id[idx] = chunk_data["chunk_id"]
+        idx += 1
 
-        # 2. Embed associated images (if any)
         for image in chunk_data["images"]:
-            image_embedding = embedding_model.encode(image)
-            embeddings.append(image_embedding)
-            index_to_chunk_id[current_index] = chunk_data["chunk_id"]
-            current_index += 1
+            img_emb = _state["embedding_model"].encode(image)
+            embeddings.append(img_emb)
+            index_to_chunk_id[idx] = chunk_data["chunk_id"]
+            idx += 1
 
-    # Convert list of embeddings to a numpy array
-    embedding_matrix = np.array(embeddings).astype('float32')
-
-    # Create a FAISS index
-    dimension = embedding_matrix.shape[1]
-    faiss_index = faiss.IndexFlatL2(dimension)
-    faiss_index.add(embedding_matrix)
-
-    print(f"FAISS index created with {faiss_index.ntotal} vectors.")
+    matrix = np.array(embeddings).astype("float32")
+    faiss_index = faiss.IndexFlatL2(matrix.shape[1])
+    faiss_index.add(matrix)
     return faiss_index, index_to_chunk_id
 
-# --- 5. Querying Pipeline ---
-def query_pipeline(query: str, faiss_index, index_to_chunk_id: Dict, all_chunks_data: List[Dict], k: int = 3):
-    """
-    Searches FAISS for relevant chunks, retrieves corresponding subgraphs from Neo4j,
-    and also retrieves the associated images.
-    Returns retrieved graph data and a list of unique images associated with the retrieved chunks.
-    """
-    print(f"\n--- Running Query: '{query}' ---")
 
-    # 1. FAISS Search
-    query_embedding = embedding_model.encode([query]).astype('float32')
-    distances, indices = faiss_index.search(query_embedding, k)
+def query_pipeline(query: str, k: int = 3):
+    """Search FAISS + Neo4j and return (text_results, images)."""
+    query_emb = _state["embedding_model"].encode([query]).astype("float32")
+    distances, indices = _state["faiss_index"].search(query_emb, k)
 
-    # Get the unique chunk IDs from the top k results
-    retrieved_chunk_ids = list(set([index_to_chunk_id[i] for i in indices[0]]))
-    print(f"FAISS search found relevant chunk IDs: {retrieved_chunk_ids}")
+    retrieved_ids = list(set(
+        _state["index_to_chunk_id"][i] for i in indices[0]
+    ))
 
-    # 2. Retrieve associated images based on retrieved_chunk_ids
-    retrieved_images = []
-    for chunk_data in all_chunks_data:
-        if chunk_data["chunk_id"] in retrieved_chunk_ids:
-            retrieved_images.extend(chunk_data["images"])
+    # Collect unique images from matching chunks
+    unique_images: List[Image.Image] = []
+    seen = set()
+    for chunk in _state["all_chunk_data"]:
+        if chunk["chunk_id"] in retrieved_ids:
+            for img in chunk["images"]:
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                h = hash(buf.getvalue())
+                if h not in seen:
+                    unique_images.append(img)
+                    seen.add(h)
 
-    # Get unique images to avoid duplicates if multiple chunks from the same page are retrieved
-    unique_images = []
-    seen_images = set()
-    for img in retrieved_images:
-      img_bytes = io.BytesIO()
-      img.save(img_bytes, format="PNG")
-      img_hash = hash(img_bytes.getvalue())
-      if img_hash not in seen_images:
-        unique_images.append(img)
-        seen_images.add(img_hash)
-
-
-    # 3. Neo4j Search
-    cypher_query = """
+    # Retrieve subgraph from Neo4j
+    cypher = """
     MATCH (n) WHERE n.source_chunk_id IN $chunk_ids
     OPTIONAL MATCH (n)-[r]-(m)
     RETURN n, r, m
     """
-    results = graph.query(cypher_query, params={"chunk_ids": retrieved_chunk_ids})
+    graph_results = _state["graph"].query(cypher, params={"chunk_ids": retrieved_ids})
 
-    if not results:
-        print("No matching nodes found in Neo4j for the retrieved chunks.")
-
-    print(f"Retrieved {len(results)} paths from Neo4j.")
-    print(f"Retrieved {len(unique_images)} unique images associated with the retrieved chunks.")
-
-    return results, unique_images
+    return graph_results, unique_images
 
 
-PDF_FILE_PATH = "sample.pdf"
+# ===========================================================================
+# Gradio callback functions
+# ===========================================================================
 
-# Step 1: Process the PDF to get text and images per page
-pdf_data = process_pdf(PDF_FILE_PATH)
+def handle_pdf_upload(pdf_file) -> str:
+    """Process an uploaded PDF through the full pipeline."""
+    if pdf_file is None:
+        return "Please upload a PDF file first."
 
-# Step 2: Create graph from chunks and ingest into Neo4j
-all_chunk_data = create_graph_from_chunks(pdf_data)
+    try:
+        yield "Initialising services (Neo4j, LLM, embeddings)..."
+        _init_services()
 
-# Step 3: Deduplication and Entity Disambiguation Setup
-# Attempt to merge duplicate nodes based on their 'id'
-find_and_merge_duplicates(graph)
+        yield "Step 1/4  Extracting text and images from PDF..."
+        pdf_data = process_pdf(pdf_file.name)
+        page_count = len(pdf_data)
+        image_count = sum(len(p["images"]) for p in pdf_data)
 
-# # Identify potential candidates for more complex entity disambiguation (e.g., using LLM)
-# potential_disambiguation_entities = identify_potential_disambiguation_candidates(graph)
-# print("\nPotential disambiguation candidates identified. Further processing with LLM may be needed.")
+        yield f"Step 2/4  Building knowledge graph ({page_count} pages, {image_count} images)..."
+        all_chunks = create_graph_from_chunks(pdf_data)
+
+        yield "Step 3/4  Merging duplicate nodes..."
+        merged = find_and_merge_duplicates()
+
+        yield "Step 4/4  Creating FAISS embeddings index..."
+        faiss_idx, idx_map = create_faiss_index(all_chunks)
+
+        # Store in module state
+        _state["faiss_index"] = faiss_idx
+        _state["index_to_chunk_id"] = idx_map
+        _state["all_chunk_data"] = all_chunks
+        _state["ready"] = True
+
+        yield (
+            f"Done!\n"
+            f"  Pages processed: {page_count}\n"
+            f"  Images extracted: {image_count}\n"
+            f"  Text chunks created: {len(all_chunks)}\n"
+            f"  FAISS vectors: {faiss_idx.ntotal}\n"
+            f"  Duplicate nodes merged: {merged}"
+        )
+    except Exception as e:
+        yield f"Error: {e}"
 
 
-# Step 4: Create FAISS index with multimodal embeddings
-if all_chunk_data:
-    # Re-create FAISS index after potential node merges
-    faiss_index, index_to_chunk_id_map = create_faiss_index(all_chunk_data)
-    print("\nSetup complete. You can now use the query cell below.")
-else:
-    print("No chunks were processed, skipping embedding and querying.")
+def handle_query(user_query: str):
+    """Run a search query and return formatted text + images."""
+    if not _state["ready"]:
+        return "Please upload and process a PDF first (use the 'Upload PDF' tab).", []
+
+    if not user_query.strip():
+        return "Please enter a query.", []
+
+    try:
+        graph_results, images = query_pipeline(user_query)
+
+        # Format text output
+        lines = [f"Query: {user_query}", f"Graph paths retrieved: {len(graph_results)}", ""]
+        for i, record in enumerate(graph_results, 1):
+            lines.append(f"--- Result {i} ---")
+            for key, val in record.items():
+                lines.append(f"  {key}: {val}")
+            lines.append("")
+
+        if not graph_results:
+            lines.append("No matching nodes found in the knowledge graph.")
+
+        text_output = "\n".join(lines)
+        return text_output, images
+
+    except Exception as e:
+        return f"Error during query: {e}", []
 
 
+# ===========================================================================
+# Gradio UI
+# ===========================================================================
 
-user_query = input("Enter your query: ")
+def build_ui() -> gr.Blocks:
+    with gr.Blocks(title="Multimodal GraphRAG") as app:
+        gr.Markdown("# Multimodal GraphRAG\nUpload a PDF to build a knowledge graph, then query it.")
 
-# Run the query pipeline
-if 'faiss_index' in locals() and 'index_to_chunk_id_map' in locals() and 'all_chunk_data' in locals():
-    retrieved_graph_data, retrieved_images = query_pipeline(
-        query=user_query,
-        faiss_index=faiss_index,
-        index_to_chunk_id=index_to_chunk_id_map,
-        all_chunks_data=all_chunk_data
-    )
+        with gr.Tab("Upload PDF"):
+            pdf_input = gr.File(label="Choose a PDF", file_types=[".pdf"])
+            process_btn = gr.Button("Process PDF", variant="primary")
+            status_box = gr.Textbox(label="Status", lines=8, interactive=False)
 
-    # Print the retrieved graph data
-    print("\n--- Final Retrieved Graph Data ---")
-    for record in retrieved_graph_data:
-        print(record)
+            process_btn.click(fn=handle_pdf_upload, inputs=pdf_input, outputs=status_box)
 
-    # Display the retrieved images
-    print("\n--- Retrieved Images ---")
-    if retrieved_images:
-        for i, img in enumerate(retrieved_images):
-            print(f"Image {i+1}:")
-            
-    else:
-        print("No images retrieved for the relevant chunks.")
-else:
-    print("Please run the setup cell first.")
+        with gr.Tab("Query"):
+            query_input = gr.Textbox(label="Enter your question", placeholder="e.g. What are the key findings?")
+            search_btn = gr.Button("Search", variant="primary")
+            results_box = gr.Textbox(label="Results", lines=12, interactive=False)
+            image_gallery = gr.Gallery(label="Retrieved Images", columns=3, height="auto")
+
+            search_btn.click(fn=handle_query, inputs=query_input, outputs=[results_box, image_gallery])
+
+    return app
+
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
+if __name__ == "__main__":
+    app = build_ui()
+    app.launch(server_name="127.0.0.1", server_port=7860)
+

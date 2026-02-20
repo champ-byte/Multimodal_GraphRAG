@@ -1,0 +1,39 @@
+# Core ML / Embeddings
+torch>=2.10.0
+torchvision>=0.25.0
+open_clip_torch>=3.2.0
+sentence-transformers>=5.2.3
+# OpenAI CLIP (installed from GitHub)
+clip @ git+https://github.com/openai/CLIP.git
+
+# PDF processing
+PyMuPDF>=1.27.1
+
+# Image processing
+pillow>=12.1.1
+
+# Data
+pandas>=3.0.1
+numpy>=2.4.2
+faiss-cpu>=1.13.2
+
+# Graph DB
+neo4j>=6.1.0
+langchain-neo4j>=0.8.0
+
+# LangChain
+langchain>=1.2.10
+langchain-core>=1.2.14
+langchain-text-splitters>=1.1.1
+langchain-experimental>=0.4.1
+langchain-google-genai>=4.2.1
+langchain-ollama>=1.0.1
+
+# LLM
+langchain-community>=0.4.1
+
+# Web UI
+gradio>=6.6.0
+
+# Utilities
+python-dotenv>=1.2.1
